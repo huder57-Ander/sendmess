@@ -28,8 +28,8 @@
   MS_TOKEN                       - Bearer-токен общего JSON API МоегоСклада (см. README:
                                     как получить через POST /security/token)
   MS_TARGET_STATE               - точное название статуса-триггера (по умолчанию "Доставляется")
-  MS_TREK_ATTR                  - название доп. поля заказа с трек-номером (плейсхолдер "Number_DL")
-  MS_LINK_ATTR                  - название доп. поля заказа со ссылкой отслеживания (плейсхолдер "Link_DL")
+  MS_TREK_ATTR_ID                - uuid доп. поля заказа с трек-номером (не название! см. README как получить)
+  MS_LINK_ATTR_ID                - uuid доп. поля заказа со ссылкой отслеживания
   MS_DELIVERY_COMPANY           - название транспортной компании для текста сообщения (по умолчанию "Деловые Линии")
   PUBLIC_URL                    - публичный адрес этого сервиса (для регистрации обоих вебхуков)
   WEBHOOK_SECRET                - произвольная случайная строка, общий секрет для обоих вебхуков
@@ -64,8 +64,8 @@ log = logging.getLogger("ms-wazzup-notify")
 MS_BASE = "https://api.moysklad.ru/api/remap/1.2"
 MS_TOKEN = os.environ["MS_TOKEN"]
 MS_TARGET_STATE = os.getenv("MS_TARGET_STATE", "Доставляется")
-MS_TREK_ATTR = os.getenv("MS_TREK_ATTR", "Number_DL")   # ЗАГЛУШКА - заменить на реальное имя поля
-MS_LINK_ATTR = os.getenv("MS_LINK_ATTR", "Link_DL")     # ЗАГЛУШКА - заменить на реальное имя поля
+MS_TREK_ATTR_ID = os.environ["MS_TREK_ATTR_ID"]  # uuid доп.поля "Трек-номер", см. README
+MS_LINK_ATTR_ID = os.environ["MS_LINK_ATTR_ID"]  # uuid доп.поля со ссылкой отслеживания
 MS_DELIVERY_COMPANY = os.getenv("MS_DELIVERY_COMPANY", "Деловые Линии")
 
 PUBLIC_URL = os.environ["PUBLIC_URL"].rstrip("/")
@@ -120,9 +120,10 @@ async def fetch_order(href: str) -> dict:
     return (await ms_req("GET", href, params={"expand": "state,agent"})).json()
 
 
-def attr_value(order: dict, name: str) -> str:
+def attr_value(order: dict, attr_id: str) -> str:
     for a in order.get("attributes", []):
-        if a.get("name") == name:
+        a_id = ((a.get("meta") or {}).get("href") or "").rsplit("/", 1)[-1]
+        if a_id == attr_id or a.get("id") == attr_id:
             v = a.get("value")
             if isinstance(v, dict):
                 return str(v.get("name") or v.get("value") or "")
@@ -203,8 +204,12 @@ async def handle_order_update(href: str):
     agent = order.get("agent") or {}
     phone = norm_phone(agent.get("phone"))
     name = agent.get("name") or "клиент"
-    trek = attr_value(order, MS_TREK_ATTR) or "—"
-    link = attr_value(order, MS_LINK_ATTR) or "—"
+    trek = attr_value(order, MS_TREK_ATTR_ID) or "—"
+    link = attr_value(order, MS_LINK_ATTR_ID) or "—"
+    log.info("заказ %s: доп.поля заказа: %s", order_id,
+             [(a.get("id"), a.get("name"), a.get("value")) for a in order.get("attributes", [])])
+    log.info("заказ %s: ищу trek_id=%s -> %r, link_id=%s -> %r",
+             order_id, MS_TREK_ATTR_ID, trek, MS_LINK_ATTR_ID, link)
 
     if not phone:
         log.warning("заказ %s: у клиента %s не найден телефон, письмо не отправлено", order_id, name)
@@ -273,6 +278,26 @@ app = FastAPI(lifespan=lifespan)
 @app.api_route("/health", methods=["GET", "HEAD"])
 async def health():
     return {"ok": True, "pending": len(pending)}
+
+
+# ---------------------------------------------------------------- ВРЕМЕННО: обслуживание вебхуков
+# Открывать в браузере (сервис ходит в МойСклад сам, без проблем с локальной сетью).
+# После того как почистишь дубли - можно убрать оба эндпоинта.
+@app.get("/admin/ms-webhooks")
+async def admin_list_webhooks(token: str):
+    if token != WEBHOOK_SECRET:
+        raise HTTPException(403)
+    rows = (await ms_req("GET", "/entity/webhook")).json().get("rows", [])
+    return [{"id": w["id"], "url": w.get("url"), "entityType": w.get("entityType"),
+              "action": w.get("action")} for w in rows]
+
+
+@app.delete("/admin/ms-webhooks/{webhook_id}")
+async def admin_delete_webhook(webhook_id: str, token: str):
+    if token != WEBHOOK_SECRET:
+        raise HTTPException(403)
+    await ms_req("DELETE", f"/entity/webhook/{webhook_id}")
+    return {"deleted": webhook_id}
 
 
 @app.post("/moysklad/order-webhook")
