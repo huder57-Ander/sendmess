@@ -32,7 +32,8 @@
   MS_LINK_ATTR_ID                - uuid доп. поля заказа со ссылкой отслеживания
   MS_DELIVERY_COMPANY           - название транспортной компании для текста сообщения (по умолчанию "Деловые Линии")
   MS_PROJECT_FILTER             - слать только если проект заказа равен этому значению (по умолчанию "Cronon")
-  MS_EXCLUDE_AGENT_GROUPS       - группы контрагентов через запятую, которым НЕ шлём
+  MS_EXCLUDE_AGENT_GROUPS       - теги контрагента через запятую, которым НЕ шлём
+                                   (это поле "Группы" в карточке контрагента - теги, а НЕ служебный "Отдел")
                                    (по умолчанию "дилер a - 40%,дилер b,дилер c")
   PUBLIC_URL                    - публичный адрес этого сервиса (для регистрации обоих вебхуков)
   WEBHOOK_SECRET                - произвольная случайная строка, общий секрет для обоих вебхуков
@@ -129,20 +130,6 @@ async def fetch_order(href: str) -> dict:
     return (await ms_req("GET", href, params={"expand": "state,agent,project"})).json()
 
 
-async def fetch_agent_group_name(agent: dict) -> str:
-    """Группа контрагента - получаем отдельным запросом (вложенный expand agent.group
-    не всегда доступен/надёжен), чтобы не зависеть от того, что реально пришло в expand заказа."""
-    group_meta = (agent.get("group") or {}).get("meta") or {}
-    href = group_meta.get("href")
-    if not href:
-        return ""
-    try:
-        return (await ms_req("GET", href)).json().get("name") or ""
-    except Exception:
-        log.exception("не удалось получить группу контрагента по %s", href)
-        return ""
-
-
 def attr_value(order: dict, attr_id: str) -> str:
     for a in order.get("attributes", []):
         a_id = ((a.get("meta") or {}).get("href") or "").rsplit("/", 1)[-1]
@@ -231,11 +218,11 @@ async def handle_order_update(href: str):
         return
 
     agent = order.get("agent") or {}
-    group_name = await fetch_agent_group_name(agent)
-    log.info("заказ %s: контрагент=%r, группа=%r", order_id, agent.get("name"), group_name)
-    if group_name.strip().lower() in MS_EXCLUDE_AGENT_GROUPS:
-        log.info("заказ %s: группа контрагента %r в списке исключений, уведомление не отправляется",
-                  order_id, group_name)
+    agent_tags = {t.strip().lower() for t in (agent.get("tags") or [])}
+    log.info("заказ %s: контрагент=%r, теги=%r", order_id, agent.get("name"), agent.get("tags"))
+    if agent_tags & MS_EXCLUDE_AGENT_GROUPS:
+        log.info("заказ %s: у контрагента есть тег из списка исключений (%s), уведомление не отправляется",
+                  order_id, agent_tags & MS_EXCLUDE_AGENT_GROUPS)
         return
 
     phone = norm_phone(agent.get("phone"))
