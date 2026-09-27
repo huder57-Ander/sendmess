@@ -31,6 +31,9 @@
   MS_TREK_ATTR_ID                - uuid доп. поля заказа с трек-номером (не название! см. README как получить)
   MS_LINK_ATTR_ID                - uuid доп. поля заказа со ссылкой отслеживания
   MS_DELIVERY_COMPANY           - название транспортной компании для текста сообщения (по умолчанию "Деловые Линии")
+  MS_PROJECT_FILTER             - слать только если проект заказа равен этому значению (по умолчанию "Cronon")
+  MS_EXCLUDE_AGENT_GROUPS       - группы контрагентов через запятую, которым НЕ шлём
+                                   (по умолчанию "дилер a - 40%,дилер b,дилер c")
   PUBLIC_URL                    - публичный адрес этого сервиса (для регистрации обоих вебхуков)
   WEBHOOK_SECRET                - произвольная случайная строка, общий секрет для обоих вебхуков
   WAZZUP_TOKEN                  - Bearer-токен Wazzup24 (Настройки -> API)
@@ -67,6 +70,12 @@ MS_TARGET_STATE = os.getenv("MS_TARGET_STATE", "Доставляется")
 MS_TREK_ATTR_ID = os.environ["MS_TREK_ATTR_ID"]  # uuid доп.поля "Трек-номер", см. README
 MS_LINK_ATTR_ID = os.environ["MS_LINK_ATTR_ID"]  # uuid доп.поля со ссылкой отслеживания
 MS_DELIVERY_COMPANY = os.getenv("MS_DELIVERY_COMPANY", "Деловые Линии")
+MS_PROJECT_FILTER = os.getenv("MS_PROJECT_FILTER", "Cronon")  # слать только если проект заказа = это значение
+MS_EXCLUDE_AGENT_GROUPS = {
+    g.strip().lower() for g in os.getenv(
+        "MS_EXCLUDE_AGENT_GROUPS", "дилер a - 40%,дилер b,дилер c"
+    ).split(",") if g.strip()
+}  # группы контрагентов, которым уведомления НЕ шлём
 
 PUBLIC_URL = os.environ["PUBLIC_URL"].rstrip("/")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET") or secrets.token_hex(16)
@@ -117,7 +126,7 @@ async def ms_req(method: str, url_or_path: str, **kw) -> httpx.Response:
 
 
 async def fetch_order(href: str) -> dict:
-    return (await ms_req("GET", href, params={"expand": "state,agent"})).json()
+    return (await ms_req("GET", href, params={"expand": "state,agent,project,agent.group"})).json()
 
 
 def attr_value(order: dict, attr_id: str) -> str:
@@ -201,7 +210,19 @@ async def handle_order_update(href: str):
     if state_name != MS_TARGET_STATE or prev == MS_TARGET_STATE:
         return  # не переход в целевой статус - ничего не делаем
 
+    project_name = ((order.get("project") or {}).get("name")) or ""
+    if project_name != MS_PROJECT_FILTER:
+        log.info("заказ %s: проект %r != %r, уведомление не отправляется",
+                  order_id, project_name, MS_PROJECT_FILTER)
+        return
+
     agent = order.get("agent") or {}
+    group_name = ((agent.get("group") or {}).get("name")) or ""
+    if group_name.strip().lower() in MS_EXCLUDE_AGENT_GROUPS:
+        log.info("заказ %s: группа контрагента %r в списке исключений, уведомление не отправляется",
+                  order_id, group_name)
+        return
+
     phone = norm_phone(agent.get("phone"))
     name = agent.get("name") or "клиент"
     trek = attr_value(order, MS_TREK_ATTR_ID) or "—"
@@ -278,26 +299,6 @@ app = FastAPI(lifespan=lifespan)
 @app.api_route("/health", methods=["GET", "HEAD"])
 async def health():
     return {"ok": True, "pending": len(pending)}
-
-
-# ---------------------------------------------------------------- ВРЕМЕННО: обслуживание вебхуков
-# Открывать в браузере (сервис ходит в МойСклад сам, без проблем с локальной сетью).
-# После того как почистишь дубли - можно убрать оба эндпоинта.
-@app.get("/admin/ms-webhooks")
-async def admin_list_webhooks(token: str):
-    if token != WEBHOOK_SECRET:
-        raise HTTPException(403)
-    rows = (await ms_req("GET", "/entity/webhook")).json().get("rows", [])
-    return [{"id": w["id"], "url": w.get("url"), "entityType": w.get("entityType"),
-              "action": w.get("action")} for w in rows]
-
-
-@app.delete("/admin/ms-webhooks/{webhook_id}")
-async def admin_delete_webhook(webhook_id: str, token: str):
-    if token != WEBHOOK_SECRET:
-        raise HTTPException(403)
-    await ms_req("DELETE", f"/entity/webhook/{webhook_id}")
-    return {"deleted": webhook_id}
 
 
 @app.post("/moysklad/order-webhook")
