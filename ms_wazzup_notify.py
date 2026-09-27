@@ -126,7 +126,21 @@ async def ms_req(method: str, url_or_path: str, **kw) -> httpx.Response:
 
 
 async def fetch_order(href: str) -> dict:
-    return (await ms_req("GET", href, params={"expand": "state,agent,project,agent.group"})).json()
+    return (await ms_req("GET", href, params={"expand": "state,agent,project"})).json()
+
+
+async def fetch_agent_group_name(agent: dict) -> str:
+    """Группа контрагента - получаем отдельным запросом (вложенный expand agent.group
+    не всегда доступен/надёжен), чтобы не зависеть от того, что реально пришло в expand заказа."""
+    group_meta = (agent.get("group") or {}).get("meta") or {}
+    href = group_meta.get("href")
+    if not href:
+        return ""
+    try:
+        return (await ms_req("GET", href)).json().get("name") or ""
+    except Exception:
+        log.exception("не удалось получить группу контрагента по %s", href)
+        return ""
 
 
 def attr_value(order: dict, attr_id: str) -> str:
@@ -217,7 +231,8 @@ async def handle_order_update(href: str):
         return
 
     agent = order.get("agent") or {}
-    group_name = ((agent.get("group") or {}).get("name")) or ""
+    group_name = await fetch_agent_group_name(agent)
+    log.info("заказ %s: контрагент=%r, группа=%r", order_id, agent.get("name"), group_name)
     if group_name.strip().lower() in MS_EXCLUDE_AGENT_GROUPS:
         log.info("заказ %s: группа контрагента %r в списке исключений, уведомление не отправляется",
                   order_id, group_name)
