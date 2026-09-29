@@ -319,18 +319,14 @@ async def handle_order_update(href: str):
     await send_with_fallback(order_id, phone, text, "")
 
 
-async def maybe_send_new_order_notification(order: dict, href: str):
-    """Уведомление о новом заказе - шлём один раз на заказ, и только когда он
-    реально "Проведён" (applicable=true). Если заказ ещё черновик - НЕ помечаем
-    как обработанный, чтобы поймать момент проведения позже через UPDATE."""
+async def send_new_order_notification(order: dict, href: str):
+    """Собственно отправка - без всякой задержки, вызывающий код уже отвечает
+    за то, что ждать было нужно и сейчас подходящий момент. Помечает заказ как
+    обработанный (даже если дальше отфильтруется по проекту/тегам/телефону -
+    чтобы не пытаться повторно на каждый следующий UPDATE)."""
     order_id = order["id"]
     if order_id in notified_new_orders:
         return
-
-    if not order.get("applicable"):
-        log.info("заказ %s: черновик (не проведён), жду проведения", order_id)
-        return
-
     notified_new_orders.add(order_id)
     save_json(NOTIFIED_NEW_FILE, sorted(notified_new_orders))
 
@@ -359,18 +355,57 @@ async def maybe_send_new_order_notification(order: dict, href: str):
 
 
 background_tasks: set[asyncio.Task] = set()  # держим ссылки, чтобы задачи не собрал GC
+scheduled_new_orders: set[str] = set()  # order_id, для которых уже запущен отложенный запуск (не дублировать)
 
 
 async def handle_new_order_create_event(href: str):
     """По событию CREATE ждём NEW_ORDER_DELAY_SEC (номер заказа в МоёмСкладе
     присваивается не мгновенно), затем проверяем заказ. Не await'сится в самом
-    вебхуке, иначе МойСклад решит, что сервис не отвечает, и будет ретраить."""
+    вебхуке, иначе МойСклад решит, что сервис не отвечает, и будет ретраить.
+    Если заказ уже "Проведён" к этому моменту - шлём сразу (задержка уже была).
+    Если ещё черновик - ничего не делаем, дальше это подхватит
+    maybe_schedule_new_order_notification на ближайшем UPDATE."""
     await asyncio.sleep(NEW_ORDER_DELAY_SEC)
     try:
         order = await fetch_order(href)
-        await maybe_send_new_order_notification(order, href)
+        order_id = order["id"]
+        if order_id in notified_new_orders:
+            return
+        if not order.get("applicable"):
+            log.info("заказ %s: черновик (не проведён) даже через %d сек, жду проведения",
+                      order_id, NEW_ORDER_DELAY_SEC)
+            return
+        await send_new_order_notification(order, href)
     except Exception:
         log.exception("ошибка отложенной обработки нового заказа %s", href)
+
+
+async def _delayed_send_after_draft_proved(order_id: str, href: str):
+    try:
+        await asyncio.sleep(NEW_ORDER_DELAY_SEC)
+        order = await fetch_order(href)
+        await send_new_order_notification(order, href)
+    except Exception:
+        log.exception("ошибка отложенной отправки после проведения заказа %s", order_id)
+    finally:
+        scheduled_new_orders.discard(order_id)
+
+
+async def maybe_send_new_order_notification(order: dict, href: str):
+    """Вызывается на каждый UPDATE. Если заказ был черновиком и только что стал
+    "Проведён" - планируем отправку ЕЩЁ через NEW_ORDER_DELAY_SEC (та же задержка,
+    что и после CREATE), а не мгновенно."""
+    order_id = order["id"]
+    if order_id in notified_new_orders or order_id in scheduled_new_orders:
+        return
+    if not order.get("applicable"):
+        return  # всё ещё черновик - ждём
+
+    scheduled_new_orders.add(order_id)
+    log.info("заказ %s: черновик проведён, отправка запланирована через %d сек", order_id, NEW_ORDER_DELAY_SEC)
+    task = asyncio.create_task(_delayed_send_after_draft_proved(order_id, href))
+    background_tasks.add(task)
+    task.add_done_callback(background_tasks.discard)
 
 
 async def handle_wazzup_status(message_id: str, has_error: bool):
