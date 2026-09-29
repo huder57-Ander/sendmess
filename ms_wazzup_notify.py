@@ -167,7 +167,7 @@ async def fetch_order(href: str) -> dict:
 
 
 async def fetch_order_positions_text(order_href: str) -> str:
-    """-> "● Название — 2 шт.\n● Другое название — 1 шт." по позициям заказа."""
+    """-> "• Название — 2 шт.\n• Другое название — 1 шт." по позициям заказа."""
     data = (await ms_req("GET", f"{order_href}/positions",
                            params={"expand": "assortment", "limit": 100})).json()
     lines = []
@@ -175,7 +175,7 @@ async def fetch_order_positions_text(order_href: str) -> str:
         title = ((row.get("assortment") or {}).get("name")) or "—"
         qty = row.get("quantity") or 0
         qty_str = str(int(qty)) if qty == int(qty) else str(qty)
-        lines.append(f"● {title} — {qty_str} шт.")
+        lines.append(f"• {title} — {qty_str} шт.")
     return "\n".join(lines) or "—"
 
 
