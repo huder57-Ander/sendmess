@@ -1,15 +1,23 @@
-"""МойСклад (заказ покупателя меняет статус на "доставляется") -> уведомление клиенту
-через Wazzup24: сначала в MAX, и если за FALLBACK_TIMEOUT_SEC нет подтверждения
-доставки (или пришла явная ошибка) - дублируем в Telegram.
+"""МойСклад (заказ покупателя меняет статус на "доставляется" ИЛИ создаётся заново) ->
+уведомление клиенту через Wazzup24: сначала в MAX, и если за FALLBACK_TIMEOUT_SEC нет
+подтверждения доставки (или пришла явная ошибка) - дублируем в Telegram.
+
+Два независимых сценария:
+  A. Смена статуса на MS_TARGET_STATE ("Доставляется") - как раньше: трек-номер + ссылка.
+  B. Создание нового заказа (событие CREATE) - состав заказа, сумма, способ оплаты,
+     адрес доставки, ссылка на личный кабинет. Отправляется РОВНО ОДИН РАЗ на заказ
+     (учёт в NOTIFIED_NEW_FILE), чтобы повторные правки уже отправленного заказа не
+     вызывали повторную отправку - для этого используется именно событие CREATE, а
+     не проверка текущего статуса "Новый" (иначе правка старого заказа в статусе
+     "Новый" после первого деплоя тоже вызвала бы уведомление).
 
 Общая схема:
-  1. МойСклад стучится вебхуком на /moysklad/order-webhook при любом изменении
-     заказа покупателя (регистрируем вебхук сами при старте, идемпотентно).
-  2. Проверяем, что заказ реально ПЕРЕШЁЛ в целевой статус (а не просто в нём
-     уже был / изменилось что-то другое) - сравниваем с локальным кэшем
-     последнего известного статуса по каждому заказу.
-  3. Берём телефон и имя клиента из контрагента (agent) заказа, трек-номер и
-     ссылку - из кастомных полей заказа (имена полей задаются в конфиге).
+  1. МойСклад стучится вебхуком на /moysklad/order-webhook на CREATE и на UPDATE
+     заказов покупателей (регистрируем оба вебхука сами при старте, идемпотентно).
+  2. Для UPDATE - проверяем, что заказ реально ПЕРЕШЁЛ в целевой статус (сравниваем
+     с локальным кэшем последнего известного статуса по каждому заказу).
+  3. Оба сценария проверяют общие фильтры: проект заказа (MS_PROJECT_FILTER) и
+     теги контрагента (MS_EXCLUDE_AGENT_GROUPS, поле "Группы" в карточке контрагента).
   4. Шлём сообщение через Wazzup24 v3 API в MAX (chatType=max, по телефону).
   5. Ждём вебхук о статусе от Wazzup (подписка messagesAndStatuses). Если за
      FALLBACK_TIMEOUT_SEC не пришло ни одного апдейта по этому messageId, или
@@ -30,8 +38,11 @@
   MS_TARGET_STATE               - точное название статуса-триггера (по умолчанию "Доставляется")
   MS_TREK_ATTR_ID                - uuid доп. поля заказа с трек-номером (не название! см. README как получить)
   MS_LINK_ATTR_ID                - uuid доп. поля заказа со ссылкой отслеживания
+  MS_PAYMENT_ATTR_ID             - uuid доп. поля "Способ оплаты" (для уведомления о новом заказе)
   MS_DELIVERY_COMPANY           - название транспортной компании для текста сообщения (по умолчанию "Деловые Линии")
   MS_PROJECT_FILTER             - слать только если проект заказа равен этому значению (по умолчанию "Cronon")
+  MS_CONTACT_PHONE               - телефон менеджера для сообщения о новом заказе
+  MS_ACCOUNT_URL                  - ссылка на личный кабинет клиента (по умолчанию cronon.ru/client_account/orders)
   MS_EXCLUDE_AGENT_GROUPS       - теги контрагента через запятую, которым НЕ шлём
                                    (это поле "Группы" в карточке контрагента - теги, а НЕ служебный "Отдел")
                                    (по умолчанию "дилер a - 40%,дилер b,дилер c")
@@ -43,6 +54,7 @@
   FALLBACK_TIMEOUT_SEC           - таймаут ожидания доставки в MAX, сек (по умолчанию 900 = 15 мин)
   STATE_FILE                     - файл кэша статусов заказов (по умолчанию order_state.json)
   PENDING_FILE                   - файл очереди ожидающих подтверждения сообщений (по умолчанию pending.json)
+  NOTIFIED_NEW_FILE               - файл учёта заказов, о создании которых уже уведомили (по умолчанию notified_new.json)
 
 Запуск:
   uvicorn ms_wazzup_notify:app --host 0.0.0.0 --port $PORT
@@ -70,8 +82,11 @@ MS_TOKEN = os.environ["MS_TOKEN"]
 MS_TARGET_STATE = os.getenv("MS_TARGET_STATE", "Доставляется")
 MS_TREK_ATTR_ID = os.environ["MS_TREK_ATTR_ID"]  # uuid доп.поля "Трек-номер", см. README
 MS_LINK_ATTR_ID = os.environ["MS_LINK_ATTR_ID"]  # uuid доп.поля со ссылкой отслеживания
+MS_PAYMENT_ATTR_ID = os.getenv("MS_PAYMENT_ATTR_ID", "")  # uuid доп.поля "Способ оплаты" (для уведомления о новом заказе)
 MS_DELIVERY_COMPANY = os.getenv("MS_DELIVERY_COMPANY", "Деловые Линии")
 MS_PROJECT_FILTER = os.getenv("MS_PROJECT_FILTER", "Cronon")  # слать только если проект заказа = это значение
+MS_CONTACT_PHONE = os.getenv("MS_CONTACT_PHONE", "+7 (977) 760 06 30")
+MS_ACCOUNT_URL = os.getenv("MS_ACCOUNT_URL", "https://cronon.ru/client_account/orders")
 MS_EXCLUDE_AGENT_GROUPS = {
     g.strip().lower() for g in os.getenv(
         "MS_EXCLUDE_AGENT_GROUPS", "дилер a - 40%,дилер b,дилер c"
@@ -105,6 +120,16 @@ MESSAGE_TEMPLATE = (
     "Спасибо за покупку! Если возникнут вопросы — мы всегда на связи."
 )
 
+NEW_ORDER_TEMPLATE = (
+    "Здравствуйте, {name}! Ваш заказ №{order_number} принят. Спасибо, что выбрали Cronon 🤍\n\n"
+    "📌 Состав заказа:\n{positions}\n\n"
+    "Сумма к оплате: {sum} руб. ({payment_method})\n\n"
+    "📦 Доставка до двери: {address} (пожалуйста, проверьте правильность адреса)\n\n"
+    "Менеджер свяжется с вами, чтобы согласовать сроки и процесс доставки.\n\n"
+    "📍 Детали и статус заказа в личном кабинете: {account_url}\n\n"
+    "📞 Не хотите ждать звонка или нужно срочно внести правки? Позвоните нам: {contact_phone}"
+)
+
 
 def norm_phone(num) -> str | None:
     """Только цифры, с кодом страны, без '+' - формат, который просит Wazzup."""
@@ -130,6 +155,19 @@ async def fetch_order(href: str) -> dict:
     return (await ms_req("GET", href, params={"expand": "state,agent,project"})).json()
 
 
+async def fetch_order_positions_text(order_href: str) -> str:
+    """-> "— Название — 2 шт.\n— Другое название — 1 шт." по позициям заказа."""
+    data = (await ms_req("GET", f"{order_href}/positions",
+                           params={"expand": "assortment", "limit": 100})).json()
+    lines = []
+    for row in data.get("rows", []):
+        title = ((row.get("assortment") or {}).get("name")) or "—"
+        qty = row.get("quantity") or 0
+        qty_str = str(int(qty)) if qty == int(qty) else str(qty)
+        lines.append(f"— {title} — {qty_str} шт.")
+    return "\n".join(lines) or "—"
+
+
 def attr_value(order: dict, attr_id: str) -> str:
     for a in order.get("attributes", []):
         a_id = ((a.get("meta") or {}).get("href") or "").rsplit("/", 1)[-1]
@@ -141,18 +179,18 @@ def attr_value(order: dict, attr_id: str) -> str:
     return ""
 
 
-async def ensure_ms_webhook():
-    """Регистрируем вебхук на UPDATE заказов покупателей, если такого ещё нет."""
+async def ensure_ms_webhook(action: str):
+    """Регистрируем вебхук на заданное действие (UPDATE/CREATE) заказов покупателей, если такого ещё нет."""
     url = f"{PUBLIC_URL}/moysklad/order-webhook?token={WEBHOOK_SECRET}"
     existing = (await ms_req("GET", "/entity/webhook")).json().get("rows", [])
     for wh in existing:
-        if wh.get("url") == url and wh.get("entityType") == "customerorder":
-            log.info("вебхук МоегоСклада уже зарегистрирован (id=%s)", wh["id"])
+        if wh.get("url") == url and wh.get("entityType") == "customerorder" and wh.get("action") == action:
+            log.info("вебхук МоегоСклада (%s) уже зарегистрирован (id=%s)", action, wh["id"])
             return
     r = await ms_req("POST", "/entity/webhook", json={
-        "url": url, "action": "UPDATE", "entityType": "customerorder",
+        "url": url, "action": action, "entityType": "customerorder",
     })
-    log.info("вебхук МоегоСклада зарегистрирован: %s", r.json().get("id"))
+    log.info("вебхук МоегоСклада (%s) зарегистрирован: %s", action, r.json().get("id"))
 
 
 # ---------------------------------------------------------------- Wazzup
@@ -196,10 +234,44 @@ def save_json(path: Path, data):
 
 
 order_state: dict[str, str] = load_json(STATE_FILE, {})          # order_id -> последний известный статус
-pending: dict[str, dict] = load_json(PENDING_FILE, {})           # messageId -> {order_id, phone, text, sent_at}
+pending: dict[str, dict] = load_json(PENDING_FILE, {})           # messageId -> {order_id, phone, text, crm_suffix, sent_at}
+NOTIFIED_NEW_FILE = Path(os.getenv("NOTIFIED_NEW_FILE", "notified_new.json"))
+notified_new_orders: set[str] = set(load_json(NOTIFIED_NEW_FILE, []))  # order_id заказов, о создании которых уже уведомили
 
 
 # ---------------------------------------------------------------- бизнес-логика
+def passes_filters(order: dict, order_id: str) -> tuple[bool, dict]:
+    """Проверка фильтров проект/теги. Возвращает (прошёл?, agent)."""
+    project_name = ((order.get("project") or {}).get("name")) or ""
+    if project_name != MS_PROJECT_FILTER:
+        log.info("заказ %s: проект %r != %r, уведомление не отправляется",
+                  order_id, project_name, MS_PROJECT_FILTER)
+        return False, {}
+
+    agent = order.get("agent") or {}
+    agent_tags = {t.strip().lower() for t in (agent.get("tags") or [])}
+    log.info("заказ %s: контрагент=%r, теги=%r", order_id, agent.get("name"), agent.get("tags"))
+    if agent_tags & MS_EXCLUDE_AGENT_GROUPS:
+        log.info("заказ %s: у контрагента есть тег из списка исключений (%s), уведомление не отправляется",
+                  order_id, agent_tags & MS_EXCLUDE_AGENT_GROUPS)
+        return False, {}
+    return True, agent
+
+
+async def send_with_fallback(order_id: str, phone: str, text: str, crm_suffix: str):
+    """Шлём в MAX; если сразу не вышло - тут же дублируем в Telegram; если вышло -
+    кладём в pending, дальше судьбу решает handle_wazzup_status/sweep_pending."""
+    message_id = await wazzup_send(WAZZUP_CHANNEL_MAX, "max", phone, text, f"ms-order-{order_id}{crm_suffix}-max")
+    if not message_id:
+        await wazzup_send(WAZZUP_CHANNEL_TELEGRAM, "telegram", phone, text, f"ms-order-{order_id}{crm_suffix}-tg")
+        return
+    pending[message_id] = {
+        "order_id": order_id, "phone": phone, "text": text, "crm_suffix": crm_suffix,
+        "sent_at": datetime.now(timezone.utc).isoformat(),
+    }
+    save_json(PENDING_FILE, pending)
+
+
 async def handle_order_update(href: str):
     order = await fetch_order(href)
     order_id = order["id"]
@@ -211,18 +283,8 @@ async def handle_order_update(href: str):
     if state_name != MS_TARGET_STATE or prev == MS_TARGET_STATE:
         return  # не переход в целевой статус - ничего не делаем
 
-    project_name = ((order.get("project") or {}).get("name")) or ""
-    if project_name != MS_PROJECT_FILTER:
-        log.info("заказ %s: проект %r != %r, уведомление не отправляется",
-                  order_id, project_name, MS_PROJECT_FILTER)
-        return
-
-    agent = order.get("agent") or {}
-    agent_tags = {t.strip().lower() for t in (agent.get("tags") or [])}
-    log.info("заказ %s: контрагент=%r, теги=%r", order_id, agent.get("name"), agent.get("tags"))
-    if agent_tags & MS_EXCLUDE_AGENT_GROUPS:
-        log.info("заказ %s: у контрагента есть тег из списка исключений (%s), уведомление не отправляется",
-                  order_id, agent_tags & MS_EXCLUDE_AGENT_GROUPS)
+    ok, agent = passes_filters(order, order_id)
+    if not ok:
         return
 
     phone = norm_phone(agent.get("phone"))
@@ -239,17 +301,41 @@ async def handle_order_update(href: str):
         return
 
     text = MESSAGE_TEMPLATE.format(name=name, company=MS_DELIVERY_COMPANY, trek=trek, link=link)
-    message_id = await wazzup_send(WAZZUP_CHANNEL_MAX, "max", phone, text, f"ms-order-{order_id}-max")
-    if not message_id:
-        # сразу не удалось отправить в MAX - пробуем Telegram без ожидания
-        await wazzup_send(WAZZUP_CHANNEL_TELEGRAM, "telegram", phone, text, f"ms-order-{order_id}-tg")
+    await send_with_fallback(order_id, phone, text, "")
+
+
+async def handle_new_order(href: str):
+    order = await fetch_order(href)
+    order_id = order["id"]
+
+    if order_id in notified_new_orders:
+        log.info("заказ %s: уведомление о создании уже отправлялось, пропускаю", order_id)
+        return
+    notified_new_orders.add(order_id)
+    save_json(NOTIFIED_NEW_FILE, sorted(notified_new_orders))
+
+    ok, agent = passes_filters(order, order_id)
+    if not ok:
         return
 
-    pending[message_id] = {
-        "order_id": order_id, "phone": phone, "text": text,
-        "sent_at": datetime.now(timezone.utc).isoformat(),
-    }
-    save_json(PENDING_FILE, pending)
+    phone = norm_phone(agent.get("phone"))
+    name = agent.get("name") or "клиент"
+    if not phone:
+        log.warning("заказ %s: у клиента %s не найден телефон, уведомление о заказе не отправлено", order_id, name)
+        return
+
+    positions = await fetch_order_positions_text(href)
+    sum_rub = (order.get("sum") or 0) / 100
+    sum_str = format(sum_rub, ",.0f").replace(",", " ")
+    payment_method = attr_value(order, MS_PAYMENT_ATTR_ID) or "—" if MS_PAYMENT_ATTR_ID else "—"
+    address = order.get("shipmentAddress") or "—"
+
+    text = NEW_ORDER_TEMPLATE.format(
+        name=name, order_number=order.get("name") or order_id, positions=positions,
+        sum=sum_str, payment_method=payment_method, address=address,
+        account_url=MS_ACCOUNT_URL, contact_phone=MS_CONTACT_PHONE,
+    )
+    await send_with_fallback(order_id, phone, text, "-new")
 
 
 async def handle_wazzup_status(message_id: str, has_error: bool):
@@ -259,7 +345,7 @@ async def handle_wazzup_status(message_id: str, has_error: bool):
     if has_error:
         log.warning("Wazzup сообщил об ошибке по messageId=%s, дублирую в Telegram", message_id)
         await wazzup_send(WAZZUP_CHANNEL_TELEGRAM, "telegram", info["phone"], info["text"],
-                           f"ms-order-{info['order_id']}-tg")
+                           f"ms-order-{info['order_id']}{info.get('crm_suffix', '')}-tg")
     else:
         log.info("messageId=%s: получен статус без ошибки, считаю доставленным", message_id)
     del pending[message_id]
@@ -276,7 +362,7 @@ async def sweep_pending():
                 log.warning("messageId=%s: нет подтверждения %d сек, дублирую в Telegram",
                             message_id, FALLBACK_TIMEOUT_SEC)
                 await wazzup_send(WAZZUP_CHANNEL_TELEGRAM, "telegram", info["phone"], info["text"],
-                                   f"ms-order-{info['order_id']}-tg")
+                                   f"ms-order-{info['order_id']}{info.get('crm_suffix', '')}-tg")
                 del pending[message_id]
                 save_json(PENDING_FILE, pending)
 
@@ -285,7 +371,8 @@ async def sweep_pending():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     try:
-        await ensure_ms_webhook()
+        await ensure_ms_webhook("UPDATE")
+        await ensure_ms_webhook("CREATE")
         await ensure_wazzup_webhook()
     except Exception:
         log.exception("не удалось зарегистрировать вебхуки при старте")
@@ -312,10 +399,14 @@ async def moysklad_webhook(request: Request, token: str):
         meta = ev.get("meta") or {}
         if meta.get("type") != "customerorder":
             continue
+        action = ev.get("action")
         try:
-            await handle_order_update(meta["href"])
+            if action == "CREATE":
+                await handle_new_order(meta["href"])
+            else:
+                await handle_order_update(meta["href"])
         except Exception:
-            log.exception("ошибка обработки события заказа %s", meta.get("href"))
+            log.exception("ошибка обработки события заказа (%s) %s", action, meta.get("href"))
     return {"ok": True}
 
 
