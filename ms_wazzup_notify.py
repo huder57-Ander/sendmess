@@ -10,6 +10,15 @@
      вызывали повторную отправку - для этого используется именно событие CREATE, а
      не проверка текущего статуса "Новый" (иначе правка старого заказа в статусе
      "Новый" после первого деплоя тоже вызвала бы уведомление).
+     Два нюанса сценария B:
+       - После CREATE ждём NEW_ORDER_DELAY_SEC (по умолчанию 5 мин), т.к. номер
+         заказа (поле "name", например "S-2079") присваивается в МоёмСкладе не
+         мгновенно; ожидание идёт в фоне, вебхуку сразу отвечаем 200.
+       - Если через это время заказ всё ещё черновик (поле "applicable"=false,
+         чекбокс "Проведено" не стоит) - НЕ отправляем и НЕ отмечаем как
+         обработанный. Далее каждый UPDATE этого заказа проверяет "applicable"
+         заново (maybe_send_new_order_notification) - как только заказ проведут,
+         уведомление уйдёт тогда, без дополнительного ожидания.
 
 Общая схема:
   1. МойСклад стучится вебхуком на /moysklad/order-webhook на CREATE и на UPDATE
@@ -43,6 +52,7 @@
   MS_PROJECT_FILTER             - слать только если проект заказа равен этому значению (по умолчанию "Cronon")
   MS_CONTACT_PHONE               - телефон менеджера для сообщения о новом заказе
   MS_ACCOUNT_URL                  - ссылка на личный кабинет клиента (по умолчанию cronon.ru/client_account/orders)
+  NEW_ORDER_DELAY_SEC             - задержка после CREATE перед проверкой/отправкой, сек (по умолчанию 300 = 5 мин)
   MS_EXCLUDE_AGENT_GROUPS       - теги контрагента через запятую, которым НЕ шлём
                                    (это поле "Группы" в карточке контрагента - теги, а НЕ служебный "Отдел")
                                    (по умолчанию "дилер a - 40%,дилер b,дилер c")
@@ -87,6 +97,7 @@ MS_DELIVERY_COMPANY = os.getenv("MS_DELIVERY_COMPANY", "Деловые Лини�
 MS_PROJECT_FILTER = os.getenv("MS_PROJECT_FILTER", "Cronon")  # слать только если проект заказа = это значение
 MS_CONTACT_PHONE = os.getenv("MS_CONTACT_PHONE", "+7 (977) 760 06 30")
 MS_ACCOUNT_URL = os.getenv("MS_ACCOUNT_URL", "https://cronon.ru/client_account/orders")
+NEW_ORDER_DELAY_SEC = int(os.getenv("NEW_ORDER_DELAY_SEC", "300"))  # ждём 5 мин после CREATE - номер заказа присваивается не сразу
 MS_EXCLUDE_AGENT_GROUPS = {
     g.strip().lower() for g in os.getenv(
         "MS_EXCLUDE_AGENT_GROUPS", "дилер a - 40%,дилер b,дилер c"
@@ -124,7 +135,7 @@ NEW_ORDER_TEMPLATE = (
     "Здравствуйте, {name}! Ваш заказ №{order_number} принят. Спасибо, что выбрали Cronon 🤍\n\n"
     "📌 Состав заказа:\n{positions}\n\n"
     "Сумма к оплате: {sum} руб. ({payment_method})\n\n"
-    "📦 Доставка до двери: {address} (пожалуйста, проверьте правильность адреса)\n\n"
+    "📦 Адрес доставки: {address} (пожалуйста, проверьте правильность адреса)\n\n"
     "Менеджер свяжется с вами, чтобы согласовать сроки и процесс доставки.\n\n"
     "📍 Детали и статус заказа в личном кабинете: {account_url}\n\n"
     "📞 Не хотите ждать звонка или нужно срочно внести правки? Позвоните нам: {contact_phone}"
@@ -156,7 +167,7 @@ async def fetch_order(href: str) -> dict:
 
 
 async def fetch_order_positions_text(order_href: str) -> str:
-    """-> "— Название — 2 шт.\n— Другое название — 1 шт." по позициям заказа."""
+    """-> "● Название — 2 шт.\n● Другое название — 1 шт." по позициям заказа."""
     data = (await ms_req("GET", f"{order_href}/positions",
                            params={"expand": "assortment", "limit": 100})).json()
     lines = []
@@ -164,7 +175,7 @@ async def fetch_order_positions_text(order_href: str) -> str:
         title = ((row.get("assortment") or {}).get("name")) or "—"
         qty = row.get("quantity") or 0
         qty_str = str(int(qty)) if qty == int(qty) else str(qty)
-        lines.append(f"— {title} — {qty_str} шт.")
+        lines.append(f"● {title} — {qty_str} шт.")
     return "\n".join(lines) or "—"
 
 
@@ -280,6 +291,10 @@ async def handle_order_update(href: str):
     order_state[order_id] = state_name
     save_json(STATE_FILE, order_state)
 
+    # Заказ мог быть создан как черновик (см. maybe_send_new_order_notification) -
+    # проверяем на каждом UPDATE, не наступил ли момент "Проведено", раз CREATE его пропустил.
+    await maybe_send_new_order_notification(order, href)
+
     if state_name != MS_TARGET_STATE or prev == MS_TARGET_STATE:
         return  # не переход в целевой статус - ничего не делаем
 
@@ -304,13 +319,18 @@ async def handle_order_update(href: str):
     await send_with_fallback(order_id, phone, text, "")
 
 
-async def handle_new_order(href: str):
-    order = await fetch_order(href)
+async def maybe_send_new_order_notification(order: dict, href: str):
+    """Уведомление о новом заказе - шлём один раз на заказ, и только когда он
+    реально "Проведён" (applicable=true). Если заказ ещё черновик - НЕ помечаем
+    как обработанный, чтобы поймать момент проведения позже через UPDATE."""
     order_id = order["id"]
-
     if order_id in notified_new_orders:
-        log.info("заказ %s: уведомление о создании уже отправлялось, пропускаю", order_id)
         return
+
+    if not order.get("applicable"):
+        log.info("заказ %s: черновик (не проведён), жду проведения", order_id)
+        return
+
     notified_new_orders.add(order_id)
     save_json(NOTIFIED_NEW_FILE, sorted(notified_new_orders))
 
@@ -336,6 +356,21 @@ async def handle_new_order(href: str):
         account_url=MS_ACCOUNT_URL, contact_phone=MS_CONTACT_PHONE,
     )
     await send_with_fallback(order_id, phone, text, "-new")
+
+
+background_tasks: set[asyncio.Task] = set()  # держим ссылки, чтобы задачи не собрал GC
+
+
+async def handle_new_order_create_event(href: str):
+    """По событию CREATE ждём NEW_ORDER_DELAY_SEC (номер заказа в МоёмСкладе
+    присваивается не мгновенно), затем проверяем заказ. Не await'сится в самом
+    вебхуке, иначе МойСклад решит, что сервис не отвечает, и будет ретраить."""
+    await asyncio.sleep(NEW_ORDER_DELAY_SEC)
+    try:
+        order = await fetch_order(href)
+        await maybe_send_new_order_notification(order, href)
+    except Exception:
+        log.exception("ошибка отложенной обработки нового заказа %s", href)
 
 
 async def handle_wazzup_status(message_id: str, has_error: bool):
@@ -400,11 +435,13 @@ async def moysklad_webhook(request: Request, token: str):
         if meta.get("type") != "customerorder":
             continue
         action = ev.get("action")
+        if action == "CREATE":
+            task = asyncio.create_task(handle_new_order_create_event(meta["href"]))
+            background_tasks.add(task)
+            task.add_done_callback(background_tasks.discard)
+            continue
         try:
-            if action == "CREATE":
-                await handle_new_order(meta["href"])
-            else:
-                await handle_order_update(meta["href"])
+            await handle_order_update(meta["href"])
         except Exception:
             log.exception("ошибка обработки события заказа (%s) %s", action, meta.get("href"))
     return {"ok": True}
